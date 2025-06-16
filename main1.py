@@ -1,7 +1,8 @@
-# main.py
+#main1.py digunakan untuk khusus perangkat orangepi5 dengan menggunakan fastapi dan model rknn.
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from rknn.api import RKNN
 import cv2
 import numpy as np
 from pathlib import Path
@@ -9,212 +10,215 @@ import settings
 import io
 from PIL import Image
 import base64
-import time
-import json
 import asyncio
 
-# Impor RKNN API
-from rknn.api import RKNN # Penting: Pastikan rknn-toolkit-lite terinstal di Orange Pi
-
 app = FastAPI()
-
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Variabel global untuk instance RKNN
-rknn_instance = None
-RKNN_MODEL_FILE = Path(settings.DETECTION_MODEL)
+# Initialize RKNN model
+model_path = Path(settings.DETECTION_MODEL)
+try:
+    rknn = RKNN(verbose=True)
+    model_path_str = str(model_path)
+    if rknn.load_rknn(model_path_str) != 0:
+        raise Exception(f"Failed to load RKNN model from {model_path_str}")
+    if rknn.init_runtime(target='rk3588') != 0:
+        raise Exception("Failed to initialize RKNN runtime")
+except Exception as ex:
+    raise Exception(f"Unable to load RKNN model. Check the specified path: {model_path} - {ex}")
 
-# Event untuk memberi sinyal stop ke webcam stream
+latest_webcam_results = {
+    "recyclable": [],
+    "non_recyclable": [],
+    "hazardous": []
+}
+
 webcam_stop_event = asyncio.Event()
 
-# --- Fungsi Pemuatan dan Pelepasan Model RKNN ---
-@app.on_event("startup")
-async def startup_event():
-    global rknn_instance
-    print(f"--> Memuat model RKNN: {RKNN_MODEL_FILE}")
-    
-    rknn_instance = RKNN(verbose=True) # Set verbose=False untuk output lebih ringkas
-    
-    # Memuat model RKNN dari file
-    ret = rknn_instance.load_rknn(str(RKNN_MODEL_FILE))
-    if ret != 0:
-        print(f"Gagal memuat model RKNN! Kode return: {ret}")
-        # Jika model gagal dimuat, aplikasi mungkin tidak bisa berfungsi.
-        # Lempar Exception agar FastAPI tidak jalan jika model esensial.
-        raise Exception(f"Gagal memuat model RKNN dari {RKNN_MODEL_FILE}. Pastikan model valid dan RKNN Toolkit Lite terinstal dengan benar.")
-    print("Selesai memuat model.")
+def classify_waste_type(detected_items):
+    recyclable_items = set(detected_items) & set(settings.RECYCLABLE)
+    non_recyclable_items = set(detected_items) & set(settings.NON_RECYCLABLE)
+    hazardous_items = set(detected_items) & set(settings.HAZARDOUS)
+    return recyclable_items, non_recyclable_items, hazardous_items
 
-    # Inisialisasi runtime environment
-    print("--> Menginisialisasi runtime RKNN...")
-    # async_mode=False lebih sederhana untuk memulai. async_mode=True jika butuh inferensi non-blocking yang kompleks.
-    ret = rknn_instance.init_runtime(async_mode=False) 
-    if ret != 0:
-        print(f"Gagal inisialisasi runtime RKNN! Kode return: {ret}")
-        raise Exception("Gagal menginisialisasi runtime RKNN. Pastikan perangkat keras dan driver siap.")
-    print("Runtime RKNN siap.")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global rknn_instance
-    if rknn_instance:
-        print("--> Melepaskan instance RKNN...")
-        rknn_instance.release()
-        print("Instance RKNN dilepaskan.")
-
-# --- Fungsi Preprocessing dan Postprocessing untuk RKNN ---
+def remove_dash_from_class_name(class_name):
+    return class_name.replace("_", " ")
 
 def preprocess_image_for_rknn(image_np):
-    """
-    Melakukan preprocessing gambar untuk input model RKNN.
-    Gambar harus dalam format BGR dari OpenCV.
-    """
-    # Mengubah BGR ke RGB (model YOLOv8 umumnya dilatih dengan RGB)
+    """Preprocess image for RKNN model input using letterboxing."""
     img_rgb = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
     
-    # Resize ke ukuran input model yang diharapkan (misal: 640x640)
-    img_resized = cv2.resize(img_rgb, 
-                             (settings.MODEL_INPUT_WIDTH, settings.MODEL_INPUT_HEIGHT), 
-                             interpolation=cv2.INTER_LINEAR)
+    original_h, original_w = img_rgb.shape[:2]
     
-    # Menambahkan dimensi batch (1, H, W, C). RKNN Toolkit biasanya mengharapkan HWC.
-    input_data = np.expand_dims(img_resized, axis=0).astype(np.float32)
+    # Calculate scaling factors
+    scale = min(settings.MODEL_INPUT_WIDTH / original_w, settings.MODEL_INPUT_HEIGHT / original_h)
     
-    # Normalisasi: RKNN Toolkit biasanya menangani ini berdasarkan mean_values dan std_values
-    # yang dikonfigurasi saat konversi. Jika tidak, Anda mungkin perlu melakukan normalisasi
-    # secara eksplisit di sini (misalnya: input_data /= 255.0).
+    # New dimensions after scaling (maintaining aspect ratio)
+    new_w, new_h = int(original_w * scale), int(original_h * scale)
+    
+    # Resize image
+    resized_img = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    
+    # Create a blank canvas for padding (usually grey 128)
+    padded_img = np.full((settings.MODEL_INPUT_HEIGHT, settings.MODEL_INPUT_WIDTH, 3), 128, dtype=np.uint8) 
+    
+    # Calculate padding offsets
+    x_offset = (settings.MODEL_INPUT_WIDTH - new_w) // 2
+    y_offset = (settings.MODEL_INPUT_HEIGHT - new_h) // 2
+    
+    # Place the resized image onto the center of the padded canvas
+    padded_img[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = resized_img
+    
+    input_data = np.expand_dims(padded_img, axis=0).astype(np.float32)
+    # Penting: RKNN seringkali mengharapkan input dalam rentang [0, 255] atau [0, 1]
+    # Jika model Anda dinormalisasi [0, 1] saat training, Anda perlu membagi 255.0
+    # Jika tidak, biarkan saja sebagai np.float32 (0-255)
+    # Periksa dokumentasi RKNN model Anda atau cara training YOLOv8 Anda diekspor.
+    # Untuk sebagian besar konversi RKNN, [0, 255] float32 sudah benar.
+    
+    print(f"DEBUG PREPROCESS - Original: {original_w}x{original_h}, Scaled: {new_w}x{new_h}, Padded: {padded_img.shape}, x_offset: {x_offset}, y_offset: {y_offset}")
     return input_data
 
+def decode_yolov8_boxes(boxes, anchors, stride, img_size):
+    """Decode YOLOv8 anchor-based boxes to absolute coordinates."""
+    boxes = boxes.copy()
+    boxes[:, 0] = (boxes[:, 0] * stride)
+    boxes[:, 1] = (boxes[:, 1] * stride)
+    boxes[:, 2] = boxes[:, 2] * anchors[:, 0]
+    boxes[:, 3] = boxes[:, 3] * anchors[:, 1]
+    
+    x1 = boxes[:, 0] - boxes[:, 2] / 2
+    y1 = boxes[:, 1] - boxes[:, 3] / 2
+    x2 = boxes[:, 0] + boxes[:, 2] / 2
+    y2 = boxes[:, 1] + boxes[:, 3] / 2
+    
+    x1 = np.clip(x1, 0, img_size[1])
+    y1 = np.clip(y1, 0, img_size[0])
+    x2 = np.clip(x2, 0, img_size[1])
+    y2 = np.clip(y2, 0, img_size[0])
+    
+    return np.stack([x1, y1, x2, y2], axis=-1)
+
+import numpy as np
+import cv2
+import settings # Assuming settings.py contains MODEL_INPUT_WIDTH, MODEL_INPUT_HEIGHT, ALL_CLASSES, CONF_THRESHOLD, NMS_IOU_THRESHOLD
+
 def postprocess_yolov8_rknn_output(rknn_outputs, original_img_shape):
-    """
-    Melakukan post-processing pada output mentah dari model RKNN YOLOv8.
-    Ini termasuk decoding bounding box, scores, dan Non-Maximum Suppression (NMS).
-    """
-    # RKNN output adalah list of numpy arrays.
-    # Untuk YOLOv8, output deteksi biasanya tensor tunggal.
-    # Format ini sangat tergantung pada bagaimana model Anda diekspor/dikonversi.
-    # Seringkali, outputnya adalah (1, num_det, 5 + num_classes) atau (1, 5 + num_classes, num_det).
-    # Anda mungkin perlu menyesuaikan berdasarkan `rknn_outputs[0].shape` saat debugging.
-    
-    # Asumsi umum untuk YOLOv8 ONNX/RKNN output: (1, num_values, num_detections)
-    # where num_values = 4 (bbox) + 1 (objectness) + num_classes
-    predictions = rknn_outputs[0] # Ambil tensor output pertama
-    
-    # Transpose jika perlu untuk mendapatkan (num_detections, 5 + num_classes)
-    if predictions.shape[1] == (5 + len(settings.ALL_CLASSES)):
-        # Jika bentuknya (1, 5+num_classes, num_detections)
-        predictions = predictions[0].T # Transpose ke (num_detections, 5+num_classes)
-    elif predictions.shape[0] == 1:
-        # Jika bentuknya (1, num_detections, 5+num_classes)
-        predictions = predictions[0] # Cukup ambil batch pertama
-    else:
-        print(f"Peringatan: Bentuk output RKNN tidak dikenal: {predictions.shape}")
-        return [], [], [], original_img_shape # Kembalikan kosong jika bentuk tidak sesuai
+    print(f"DEBUG POSTPROCESS - RKNN outputs shapes: {[output.shape for output in rknn_outputs]}")
 
-    boxes = []
-    confidences = []
-    class_ids = []
+    # YOLOv8 output structure is typically (1, num_classes + 4, num_anchors)
+    # or sometimes (1, num_anchors, num_classes + 4) depending on export.
+    # From your transpose, it seems to be (1, num_classes + 4, num_anchors).
+    predictions = rknn_outputs[0]
+    # Transpose to (1, num_anchors, num_classes + 4)
+    predictions = predictions.transpose(0, 2, 1)
+    predictions = predictions[0] # Remove batch dimension, shape becomes (num_anchors, num_classes + 4)
+    print(f"DEBUG POSTPROCESS - Predictions shape after transpose: {predictions.shape}")
 
-    # Iterasi setiap deteksi
-    for detection in predictions:
-        # Asumsi: [center_x, center_y, width, height, objectness_score, class_score_1, class_score_2, ...]
-        bbox_data = detection[:4]
-        obj_conf = detection[4]
-        class_scores = detection[5:]
+    num_classes = len(settings.ALL_CLASSES)
+    img_h, img_w = original_img_shape
+    input_h, input_w = settings.MODEL_INPUT_HEIGHT, settings.MODEL_INPUT_WIDTH
 
-        # Menggabungkan objectness confidence dengan class scores
-        scores = obj_conf * class_scores
+    # Extract boxes (cx, cy, w, h) and scores
+    # YOLOv8 outputs are usually cx, cy, w, h followed by class scores
+    boxes_raw = predictions[:, :4] # cx, cy, w, h
+    scores = predictions[:, 4:]    # Class scores
 
-        class_id = np.argmax(scores)
-        confidence = scores[class_id]
+    max_scores = np.max(scores, axis=1)
+    class_ids = np.argmax(scores, axis=1)
 
-        if confidence >= settings.CONF_THRESHOLD:
-            center_x, center_y, width, height = bbox_data
+    # Filter by confidence threshold
+    mask = max_scores >= settings.CONF_THRESHOLD
+    boxes = boxes_raw[mask]
+    max_scores = max_scores[mask]
+    class_ids = class_ids[mask]
 
-            # Konversi dari (center_x, center_y, width, height) ke (x1, y1, x2, y2)
-            x1 = int(center_x - width / 2)
-            y1 = int(center_y - height / 2)
-            x2 = int(center_x + width / 2)
-            y2 = int(center_y + height / 2)
+    if len(boxes) == 0:
+        print("No detections after confidence filtering.")
+        return [], [], [], original_img_shape
 
-            boxes.append([x1, y1, x2, y2])
-            confidences.append(float(confidence))
-            class_ids.append(class_id)
-    
-    # Aplikasikan Non-Maximum Suppression (NMS)
-    # cv2.dnn.NMSBoxes membutuhkan format (x, y, w, h) untuk kotak.
-    # Kita perlu mengubah format kotak untuk NMS
-    nms_boxes = [[x, y, w - x, h - y] for x, y, w, h in boxes]
-    
-    indices = cv2.dnn.NMSBoxes(nms_boxes, confidences, settings.CONF_THRESHOLD, settings.NMS_IOU_THRESHOLD)
-    
+    # --- UNLETTERBOXING AND UNSCALING LOGIC ---
+    # Calculate the scale factor that was applied during preprocessing (letterboxing)
+    scale = min(input_w / img_w, input_h / img_h)
+
+    # Calculate the dimensions of the original image *within* the padded model input
+    unpadded_w_in_model_coords = int(img_w * scale)
+    unpadded_h_in_model_coords = int(img_h * scale)
+
+    # Calculate the padding offsets in model input coordinates
+    x_offset_in_model_coords = (input_w - unpadded_w_in_model_coords) // 2
+    y_offset_in_model_coords = (input_h - unpadded_h_in_model_coords) // 2
+
+    final_boxes_on_original = []
+    for box in boxes:
+        # box: [cx_padded, cy_padded, w_padded, h_padded]
+        cx_padded, cy_padded, w_padded, h_padded = box
+
+        # Unpad the center coordinates
+        cx_unpadded = cx_padded - x_offset_in_model_coords
+        cy_unpadded = cy_padded - y_offset_in_model_coords
+
+        # Unscale the center coordinates and dimensions back to original image size
+        # We divide by the 'scale' used for letterboxing to get back to original pixel values
+        cx_original = cx_unpadded / scale
+        cy_original = cy_unpadded / scale
+        w_original = w_padded / scale
+        h_original = h_padded / scale
+
+        # Convert (cx, cy, w, h) to (x1, y1, x2, y2)
+        x1_original = cx_original - (w_original / 2)
+        y1_original = cy_original - (h_original / 2)
+        x2_original = cx_original + (w_original / 2)
+        y2_original = cy_original + (h_original / 2)
+
+        # Ensure coordinates are within original image bounds
+        x1_original = np.clip(x1_original, 0, img_w)
+        y1_original = np.clip(y1_original, 0, img_h)
+        x2_original = np.clip(x2_original, 0, img_w)
+        y2_original = np.clip(y2_original, 0, img_h)
+
+        final_boxes_on_original.append([int(x1_original), int(y1_original), int(x2_original), int(y2_original)])
+
+    # Apply NMS
+    # cv2.dnn.NMSBoxes expects [x, y, width, height]
+    nms_boxes = [[x1, y1, x2 - x1, y2 - y1] for x1, y1, x2, y2 in final_boxes_on_original]
+
+    indices = []
+    if len(nms_boxes) > 0:
+        indices = cv2.dnn.NMSBoxes(nms_boxes, max_scores.tolist(), settings.CONF_THRESHOLD, settings.NMS_IOU_THRESHOLD)
+
     final_boxes = []
     final_confidences = []
     final_class_ids = []
 
     if len(indices) > 0:
         indices = indices.flatten()
-        for i in indices:
-            final_boxes.append(boxes[i])
-            final_confidences.append(confidences[i])
-            final_class_ids.append(class_ids[i])
+        final_boxes = [final_boxes_on_original[i] for i in indices]
+        final_confidences = max_scores[indices]
+        final_class_ids = class_ids[indices]
 
-    # Sesuaikan ukuran bounding box ke dimensi gambar asli
-    original_h, original_w = original_img_shape
-    input_h, input_w = settings.MODEL_INPUT_HEIGHT, settings.MODEL_INPUT_WIDTH
+    detected_items = [settings.ALL_CLASSES[cls_id] for cls_id in final_class_ids if cls_id < num_classes]
+    print(f"DEBUG POSTPROCESS - Detected items: {detected_items}, Final boxes count: {len(final_boxes)}")
+    if final_boxes:
+        print(f"DEBUG POSTPROCESS - Example box after scaling: {final_boxes[0]}")
 
-    scale_x = original_w / input_w
-    scale_y = original_h / input_h
-
-    scaled_boxes = []
-    for box in final_boxes:
-        x1, y1, x2, y2 = box
-        scaled_x1 = int(x1 * scale_x)
-        scaled_y1 = int(y1 * scale_y)
-        scaled_x2 = int(x2 * scale_x)
-        scaled_y2 = int(y2 * scale_y)
-        scaled_boxes.append([scaled_x1, scaled_y1, scaled_x2, scaled_y2])
-
-    return scaled_boxes, final_confidences, final_class_ids, original_img_shape
+    return final_boxes, final_confidences, final_class_ids, original_img_shape
 
 def draw_boxes_on_image(image_np, boxes, confidences, class_ids):
-    """
-    Menggambar bounding box dan label pada gambar.
-    image_np diharapkan dalam format BGR.
-    """
-    names = settings.ALL_CLASSES 
-
+    """Draw detection boxes on image."""
+    image_np = image_np.copy()
+    names = settings.ALL_CLASSES
     for i in range(len(boxes)):
         x1, y1, x2, y2 = boxes[i]
         confidence = confidences[i]
         class_id = class_ids[i]
-        class_name = names[class_id]
-
-        color = (0, 255, 0) # Warna hijau untuk bounding box
-        text = f"{remove_dash_from_class_name(class_name)}: {confidence:.2f}"
-
-        cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(image_np, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        if class_id < len(names):
+            class_name = names[class_id]
+            color = (0, 255, 0)
+            text = f"{remove_dash_from_class_name(class_name)}: {confidence:.2f}"
+            cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(image_np, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return image_np
-
-# --- Fungsi Klasifikasi Sampah ---
-def classify_waste_type(detected_items):
-    """Mengklasifikasikan item yang terdeteksi ke dalam kategori sampah."""
-    # Anda perlu mendefinisikan kategori ini di settings.py juga atau di sini
-    # Contoh kategori:
-    RECYCLABLE = {'aluminium', 'cardboard', 'glass', 'paper', 'plastic'}
-    NON_RECYCLABLE = {'non_recyclable_fabric', 'food_waste', 'other_waste'}
-    HAZARDOUS = {'battery', 'hazardous_chemical_waste'} # Tambahkan kelas berbahaya Anda
-
-    recyclable_items = set(detected_items) & RECYCLABLE
-    non_recyclable_items = set(detected_items) & NON_RECYCLABLE
-    hazardous_items = set(detected_items) & HAZARDOUS
-    return recyclable_items, non_recyclable_items, hazardous_items
-
-def remove_dash_from_class_name(class_name):
-    """Membersihkan nama kelas untuk tampilan di frontend."""
-    return class_name.replace("_", " ")
-
-# --- Endpoint FastAPI ---
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
@@ -225,30 +229,23 @@ async def serve_index():
 async def detect_image(file: UploadFile = File(...)):
     try:
         contents = await file.read()
+        print("File diterima, ukuran:", len(contents))
         image = Image.open(io.BytesIO(contents)).convert("RGB")
+        print("Gambar berhasil dibaca, ukuran:", image.size)
         image_np = np.array(image)
-        # Convert ke BGR untuk OpenCV, karena OpenCV memuat dalam BGR
-        image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR) 
+        print("Array gambar:", image_np.shape)
+        image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        original_shape = image_np.shape[:2]
+        print("Bentuk asli gambar:", original_shape)
         
-        original_h, original_w, _ = image_np.shape # Simpan bentuk asli untuk post-processing
-
-        # Preprocess gambar untuk input RKNN
-        processed_image = preprocess_image_for_rknn(image_np.copy()) # Gunakan copy agar original tidak berubah
-
-        # Jalankan inferensi RKNN
-        if rknn_instance is None:
-            raise HTTPException(status_code=500, detail="Model RKNN belum dimuat atau inisialisasi gagal.")
-        rknn_outputs = rknn_instance.inference(inputs=[processed_image])
-
-        # Post-process output RKNN untuk mendapatkan kotak, confidence, dan class IDs
-        boxes, confidences, class_ids, _ = postprocess_yolov8_rknn_output(
-            rknn_outputs, (original_h, original_w)
-        )
+        input_image = preprocess_image_for_rknn(image_np)
+        print("Input preprocess selesai:", input_image.shape)
+        outputs = rknn.inference(inputs=[input_image])
+        print("Inferensi selesai, jumlah output:", len(outputs))
+        boxes, confidences, class_ids, _ = postprocess_yolov8_rknn_output(outputs, original_shape)
+        print("Hasil postprocessing:", len(boxes), "kotak terdeteksi")
         
-        # Dapatkan nama kelas yang terdeteksi
-        detected_items = set([settings.ALL_CLASSES[class_id] for class_id in class_ids])
-
-        # Klasifikasikan jenis sampah
+        detected_items = [settings.ALL_CLASSES[cls_id] for cls_id in class_ids if cls_id < len(settings.ALL_CLASSES)]
         recyclable_items, non_recyclable_items, hazardous_items = classify_waste_type(detected_items)
         
         result_dict = {
@@ -256,103 +253,86 @@ async def detect_image(file: UploadFile = File(...)):
             "non_recyclable": [remove_dash_from_class_name(item) for item in non_recyclable_items],
             "hazardous": [remove_dash_from_class_name(item) for item in hazardous_items]
         }
-
-        # Gambar bounding box pada gambar asli
-        res_plotted = draw_boxes_on_image(image_np.copy(), boxes, confidences, class_ids)
-        _, buffer = cv2.imencode(".jpg", res_plotted)
+        
+        plotted_image = draw_boxes_on_image(image_np, boxes, confidences, class_ids)
+        _, buffer = cv2.imencode(".jpg", plotted_image)
         encoded_image = base64.b64encode(buffer).decode("utf-8")
-
+        
         return {"results": result_dict, "image": encoded_image}
     except Exception as e:
-        print(f"Error selama deteksi gambar: {e}") # Debugging
-        raise HTTPException(status_code=500, detail=f"Terjadi kesalahan saat mendeteksi gambar: {e}")
+        print(f"Error selama deteksi gambar: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/video_feed")
 async def video_feed():
     global latest_webcam_results
-    webcam_stop_event.clear() # Reset event ketika stream baru dimulai
-    print("Backend: Aliran webcam dimulai, event stop direset.")
-
+    webcam_stop_event.clear()
+    print("Backend: Webcam stream started, stop event cleared.")
+    
     async def generate():
         cap = cv2.VideoCapture(settings.WEBCAM_PATH)
         if not cap.isOpened():
-            print("Backend: Error: Tidak dapat membuka webcam.")
-            # Kirim frame kosong jika kamera tidak dapat dibuka
+            print("Backend: Error: Could not open webcam.")
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' +
                    cv2.imencode(".jpg", np.zeros((480, 640, 3), dtype=np.uint8))[1].tobytes() + b'\r\n')
             return
-
-        print("Backend: Webcam berhasil dibuka. Streaming frame...")
+        
+        print("Backend: Webcam opened successfully. Streaming frames...")
         try:
             while True:
-                # Periksa apakah event stop telah diset
                 if webcam_stop_event.is_set():
-                    print("Backend: Event stop webcam terdeteksi. Keluar dari loop.")
-                    break # Keluar dari loop
-
+                    print("Backend: Webcam stop event detected. Breaking loop.")
+                    break
+                
                 success, frame = cap.read()
                 if not success:
-                    print("Backend: Error: Gagal membaca frame dari webcam. Keluar dari loop.")
+                    print("Backend: Error: Failed to read frame from webcam. Breaking loop.")
                     break
-
-                original_h, original_w, _ = frame.shape
-
-                # Preprocess frame untuk RKNN
-                processed_frame = preprocess_image_for_rknn(frame.copy())
-
-                # Jalankan inferensi RKNN
-                if rknn_instance is None:
-                    print("Backend: Model RKNN tidak dimuat selama streaming video. Melewati inferensi.")
-                    # Jika model tidak siap, kirim frame tanpa deteksi atau frame kosong
-                    _, buffer = cv2.imencode(".jpg", frame) 
-                    frame_bytes = buffer.tobytes()
-                    yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                    await asyncio.sleep(0.05)
-                    continue # Lanjutkan ke frame berikutnya
-
-                rknn_outputs = rknn_instance.inference(inputs=[processed_frame])
-
-                # Post-process output RKNN
-                boxes, confidences, class_ids, _ = postprocess_yolov8_rknn_output(
-                    rknn_outputs, (original_h, original_w)
-                )
                 
-                detected_items = set([settings.ALL_CLASSES[class_id] for class_id in class_ids])
-
-                # Klasifikasikan jenis sampah
+                original_shape = frame.shape[:2]
+                global output_image
+                output_image = frame
+                
+                input_image = preprocess_image_for_rknn(frame)
+                outputs = rknn.inference(inputs=[input_image])
+                boxes, confidences, class_ids, _ = postprocess_yolov8_rknn_output(outputs, original_shape)
+                
+                detected_items = [settings.ALL_CLASSES[cls_id] for cls_id in class_ids if cls_id < len(settings.ALL_CLASSES)]
                 recyclable_items, non_recyclable_items, hazardous_items = classify_waste_type(detected_items)
                 
-                # Perbarui variabel hasil global
                 latest_webcam_results["recyclable"] = [remove_dash_from_class_name(item) for item in recyclable_items]
                 latest_webcam_results["non_recyclable"] = [remove_dash_from_class_name(item) for item in non_recyclable_items]
                 latest_webcam_results["hazardous"] = [remove_dash_from_class_name(item) for item in hazardous_items]
-
-                # Gambar bounding box pada frame
-                res_plotted = draw_boxes_on_image(frame.copy(), boxes, confidences, class_ids)
-                _, buffer = cv2.imencode(".jpg", res_plotted)
+                
+                plotted_image = draw_boxes_on_image(frame, boxes, confidences, class_ids)
+                _, buffer = cv2.imencode(".jpg", plotted_image)
                 frame_bytes = buffer.tobytes()
-
+                
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
                 
-                await asyncio.sleep(0.01) # Jeda kecil agar feed lebih halus
+                await asyncio.sleep(0.05)
         finally:
-            # Pastikan cap.release() terpanggil bahkan jika ada error
             if cap.isOpened():
                 cap.release()
-                print("Backend: Webcam dilepaskan.")
+                print("Backend: Webcam released.")
             else:
-                print("Backend: Webcam tidak dibuka, tidak ada yang dilepaskan.")
-
+                print("Backend: Webcam was not opened, nothing to release.")
+    
     return StreamingResponse(generate(), media_type="multipart/x-mixed-replace;boundary=frame")
 
 @app.post("/stop_webcam_backend")
 async def stop_webcam_backend():
-    webcam_stop_event.set() # Set event untuk memberi sinyal stop pada stream
-    print("Backend: Menerima sinyal stop dari frontend. Event diset.")
-    return JSONResponse(content={"message": "Sinyal stop webcam terkirim."})
+    webcam_stop_event.set()
+    print("Backend: Received stop signal from frontend. Event set.")
+    return JSONResponse(content={"message": "Webcam stop signal sent."})
 
 @app.get("/webcam_classification")
 async def get_webcam_classification():
     return JSONResponse(content=latest_webcam_results)
+
+@app.on_event("shutdown")
+def cleanup():
+    rknn.release()
+    print("Backend: RKNN model released.")

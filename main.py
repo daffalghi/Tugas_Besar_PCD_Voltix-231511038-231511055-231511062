@@ -1,4 +1,5 @@
-# main.py
+# main.py digunakan untuk khusus perangkat windows dengan menggunakan fastapi dan model pt (pytorch).
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
