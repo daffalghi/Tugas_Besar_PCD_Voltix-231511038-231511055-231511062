@@ -1,4 +1,3 @@
-#main1.py digunakan untuk khusus perangkat orangepi5 dengan menggunakan fastapi dan model rknn.
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -11,6 +10,7 @@ import io
 from PIL import Image
 import base64
 import asyncio
+import time # Import the time module
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -70,11 +70,6 @@ def preprocess_image_for_rknn(image_np):
     padded_img[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = resized_img
     
     input_data = np.expand_dims(padded_img, axis=0).astype(np.float32)
-    # Penting: RKNN seringkali mengharapkan input dalam rentang [0, 255] atau [0, 1]
-    # Jika model Anda dinormalisasi [0, 1] saat training, Anda perlu membagi 255.0
-    # Jika tidak, biarkan saja sebagai np.float32 (0-255)
-    # Periksa dokumentasi RKNN model Anda atau cara training YOLOv8 Anda diekspor.
-    # Untuk sebagian besar konversi RKNN, [0, 255] float32 sudah benar.
     
     print(f"DEBUG PREPROCESS - Original: {original_w}x{original_h}, Scaled: {new_w}x{new_h}, Padded: {padded_img.shape}, x_offset: {x_offset}, y_offset: {y_offset}")
     return input_data
@@ -101,33 +96,26 @@ def decode_yolov8_boxes(boxes, anchors, stride, img_size):
 
 import numpy as np
 import cv2
-import settings # Assuming settings.py contains MODEL_INPUT_WIDTH, MODEL_INPUT_HEIGHT, ALL_CLASSES, CONF_THRESHOLD, NMS_IOU_THRESHOLD
+import settings 
 
 def postprocess_yolov8_rknn_output(rknn_outputs, original_img_shape):
     print(f"DEBUG POSTPROCESS - RKNN outputs shapes: {[output.shape for output in rknn_outputs]}")
 
-    # YOLOv8 output structure is typically (1, num_classes + 4, num_anchors)
-    # or sometimes (1, num_anchors, num_classes + 4) depending on export.
-    # From your transpose, it seems to be (1, num_classes + 4, num_anchors).
     predictions = rknn_outputs[0]
-    # Transpose to (1, num_anchors, num_classes + 4)
     predictions = predictions.transpose(0, 2, 1)
-    predictions = predictions[0] # Remove batch dimension, shape becomes (num_anchors, num_classes + 4)
+    predictions = predictions[0] 
     print(f"DEBUG POSTPROCESS - Predictions shape after transpose: {predictions.shape}")
 
     num_classes = len(settings.ALL_CLASSES)
     img_h, img_w = original_img_shape
     input_h, input_w = settings.MODEL_INPUT_HEIGHT, settings.MODEL_INPUT_WIDTH
 
-    # Extract boxes (cx, cy, w, h) and scores
-    # YOLOv8 outputs are usually cx, cy, w, h followed by class scores
-    boxes_raw = predictions[:, :4] # cx, cy, w, h
-    scores = predictions[:, 4:]    # Class scores
+    boxes_raw = predictions[:, :4] 
+    scores = predictions[:, 4:] 
 
     max_scores = np.max(scores, axis=1)
     class_ids = np.argmax(scores, axis=1)
 
-    # Filter by confidence threshold
     mask = max_scores >= settings.CONF_THRESHOLD
     boxes = boxes_raw[mask]
     max_scores = max_scores[mask]
@@ -137,41 +125,31 @@ def postprocess_yolov8_rknn_output(rknn_outputs, original_img_shape):
         print("No detections after confidence filtering.")
         return [], [], [], original_img_shape
 
-    # --- UNLETTERBOXING AND UNSCALING LOGIC ---
-    # Calculate the scale factor that was applied during preprocessing (letterboxing)
     scale = min(input_w / img_w, input_h / img_h)
 
-    # Calculate the dimensions of the original image *within* the padded model input
     unpadded_w_in_model_coords = int(img_w * scale)
     unpadded_h_in_model_coords = int(img_h * scale)
 
-    # Calculate the padding offsets in model input coordinates
     x_offset_in_model_coords = (input_w - unpadded_w_in_model_coords) // 2
     y_offset_in_model_coords = (input_h - unpadded_h_in_model_coords) // 2
 
     final_boxes_on_original = []
     for box in boxes:
-        # box: [cx_padded, cy_padded, w_padded, h_padded]
         cx_padded, cy_padded, w_padded, h_padded = box
 
-        # Unpad the center coordinates
         cx_unpadded = cx_padded - x_offset_in_model_coords
         cy_unpadded = cy_padded - y_offset_in_model_coords
 
-        # Unscale the center coordinates and dimensions back to original image size
-        # We divide by the 'scale' used for letterboxing to get back to original pixel values
         cx_original = cx_unpadded / scale
         cy_original = cy_unpadded / scale
         w_original = w_padded / scale
         h_original = h_padded / scale
 
-        # Convert (cx, cy, w, h) to (x1, y1, x2, y2)
         x1_original = cx_original - (w_original / 2)
         y1_original = cy_original - (h_original / 2)
         x2_original = cx_original + (w_original / 2)
         y2_original = cy_original + (h_original / 2)
 
-        # Ensure coordinates are within original image bounds
         x1_original = np.clip(x1_original, 0, img_w)
         y1_original = np.clip(y1_original, 0, img_h)
         x2_original = np.clip(x2_original, 0, img_w)
@@ -179,8 +157,6 @@ def postprocess_yolov8_rknn_output(rknn_outputs, original_img_shape):
 
         final_boxes_on_original.append([int(x1_original), int(y1_original), int(x2_original), int(y2_original)])
 
-    # Apply NMS
-    # cv2.dnn.NMSBoxes expects [x, y, width, height]
     nms_boxes = [[x1, y1, x2 - x1, y2 - y1] for x1, y1, x2, y2 in final_boxes_on_original]
 
     indices = []
@@ -204,8 +180,8 @@ def postprocess_yolov8_rknn_output(rknn_outputs, original_img_shape):
 
     return final_boxes, final_confidences, final_class_ids, original_img_shape
 
-def draw_boxes_on_image(image_np, boxes, confidences, class_ids):
-    """Draw detection boxes on image."""
+def draw_boxes_on_image(image_np, boxes, confidences, class_ids, fps_text=""):
+    """Draw detection boxes and FPS on image."""
     image_np = image_np.copy()
     names = settings.ALL_CLASSES
     for i in range(len(boxes)):
@@ -218,6 +194,9 @@ def draw_boxes_on_image(image_np, boxes, confidences, class_ids):
             text = f"{remove_dash_from_class_name(class_name)}: {confidence:.2f}"
             cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
             cv2.putText(image_np, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+    # Add FPS text
+    cv2.putText(image_np, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
     return image_np
 
 @app.get("/", response_class=HTMLResponse)
@@ -279,6 +258,10 @@ async def video_feed():
             return
         
         print("Backend: Webcam opened successfully. Streaming frames...")
+        
+        prev_frame_time = 0
+        new_frame_time = 0
+
         try:
             while True:
                 if webcam_stop_event.is_set():
@@ -290,9 +273,13 @@ async def video_feed():
                     print("Backend: Error: Failed to read frame from webcam. Breaking loop.")
                     break
                 
+                # Calculate FPS
+                new_frame_time = time.time()
+                fps = 1 / (new_frame_time - prev_frame_time)
+                prev_frame_time = new_frame_time
+                fps_text = f"FPS: {int(fps)}"
+
                 original_shape = frame.shape[:2]
-                global output_image
-                output_image = frame
                 
                 input_image = preprocess_image_for_rknn(frame)
                 outputs = rknn.inference(inputs=[input_image])
@@ -305,14 +292,15 @@ async def video_feed():
                 latest_webcam_results["non_recyclable"] = [remove_dash_from_class_name(item) for item in non_recyclable_items]
                 latest_webcam_results["hazardous"] = [remove_dash_from_class_name(item) for item in hazardous_items]
                 
-                plotted_image = draw_boxes_on_image(frame, boxes, confidences, class_ids)
+                # Pass fps_text to draw_boxes_on_image
+                plotted_image = draw_boxes_on_image(frame, boxes, confidences, class_ids, fps_text)
                 _, buffer = cv2.imencode(".jpg", plotted_image)
                 frame_bytes = buffer.tobytes()
                 
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
                 
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.001) # Keep this sleep very small to allow for high FPS
         finally:
             if cap.isOpened():
                 cap.release()
