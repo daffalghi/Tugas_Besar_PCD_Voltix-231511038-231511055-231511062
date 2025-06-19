@@ -41,7 +41,7 @@ Dataset ini berisi berbagai jenis sampah yang telah dianotasi untuk training mod
 ## 🚀 Instalasi
 
 ### Prasyarat
-- Python 3.8 atau lebih tinggi
+- Python 3.10 atau lebih tinggi
 - Webcam (untuk deteksi real-time)
 - Git
 
@@ -49,8 +49,7 @@ Dataset ini berisi berbagai jenis sampah yang telah dianotasi untuk training mod
 
 1. **Clone Repository**
    ```bash
-   git clone https://github.com/daffalghi/wastedetection_yolov8.git
-   cd waste-detection
+   git clone https://github.com/daffalghi/Tugas_Besar_PCD_Voltix-231511038-231511055-231511062.git
    ```
 
 2. **Install Dependencies**
@@ -110,28 +109,35 @@ Install Requirement baru
 ## 📁 Struktur Proyek
 
 ```
-waste-detection/
-│
-├── main.py              # Aplikasi utama FastAPI
-├── helper.py            # Fungsi pembantu untuk deteksi YOLO
-├── settings.py          # Konfigurasi dan pengaturan
-├── train.py            # Script untuk training model
-├── requirements.txt    # Dependencies Python
-├── README.md          # Dokumentasi proyek
-│
-├── models/            # Model YOLOv8 yang telah dilatih
-├── static/           # File statis (CSS, JS, gambar)
-└── templates/        # Template HTML
+Tugas_Besar_PCD_Voltix-231511038-231511055-231511062
+├── 01_Notebook_Eksplorasi/
+│ ├── waste_detection_yolo8.ipynb
+│ └── weights/
+|   └── best.pt
+├── 02_FastAPI_Interface/
+│ ├── main.py
+| ├── main1.py
+│ ├── requirements.txt
+| ├── convert_pt_to_rknn.py
+| ├── settings.py 
+│ └── weights/
+|   ├── best.pt
+|   └── best-rk3588.rknn
+├── 03_Dokumen_Proses_Analisis.pdf
+├── 04_File_Presentasi.pdf
+├── Link_YouTube.txt
+└── README.md 
 ```
 
 ### Deskripsi File Utama
 
 | File | Deskripsi |
 |------|-----------|
-| `main.py` | Berkas aplikasi utama yang berisi kode FastAPI untuk menjalankan web server dan API endpoints |
-| `helper.py` | Fungsi pembantu untuk deteksi sampah menggunakan model YOLO, termasuk preprocessing dan postprocessing |
+| `main.py` | Berkas aplikasi utama yang berisi kode FastAPI untuk menjalankan web server dan API endpoints dengan menggunakan YOLO|
+| `main.py` | Berkas aplikasi utama yang berisi kode FastAPI untuk menjalankan web server dan API endpoints dengan menggunakan RKNN|
 | `settings.py` | Pengaturan konfigurasi aplikasi, jalur model YOLO, dan definisi jenis sampah |
 | `train.py` | Script untuk melatih ulang model dengan dataset baru |
+| `convert_pt_to_rknn` | Berkas aplikasi yang berisi kode untuk melakukan konversi dari YOLO ke RKNN |
 
 ## 🗂️ Klasifikasi Sampah
 
@@ -239,7 +245,9 @@ Proyek ini dilisensikan di bawah [MIT License](LICENSE) - lihat file LICENSE unt
 Dikembangkan dengan ❤️ untuk lingkungan yang lebih bersih
 
 **Hubungi Developer:**
-- GitHub: [@daffalghi](https://github.com/daffalghi)
+- GitHub: [@daffalghi](https://github.com/daffalghi)  | Daffa Al Ghifari - 231511038
+- GitHub: [@mrhnprtm](https://github.com/mrhnprtm) | Muhammad Raihan Pratama - 231511055
+- GitHub: [@tresnaft](https://github.com/tresnaft) | Tresnardi Fathu Rhamdan - 231511062
 
 ---
 
