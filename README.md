@@ -71,7 +71,10 @@ Dataset ini berisi berbagai jenis sampah yang telah dianotasi untuk training mod
    ```
 
 ### Langkah Konversi Model PT ke RKNN
-
+Install Requirement baru
+```bash
+   pip install rknn-toolkit2
+   ```
 1. **Jalankan Program Konversi**
    ```bash
    python convert_pt_to_rknn.py
