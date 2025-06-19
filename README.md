@@ -70,6 +70,32 @@ Dataset ini berisi berbagai jenis sampah yang telah dianotasi untuk training mod
    http://127.0.0.1:8000
    ```
 
+### Langkah Konversi Model PT ke RKNN
+
+1. **Jalankan Program Konversi**
+   ```bash
+   python convert_pt_to_rknn.py
+   ```
+   Pastikan sudah memiliki model best.pt yang tersimpan pada folder weight.
+
+2. **Pindahkan Seluruh File ke Orange Pi 5 Pro**
+3. **Jalankan Aplikasi pada Orange Pi 5 Pro**
+   Pastikan dependensi dan requirement sudah terinstall pada Orange Pi 5 Pro dengan menjalankan
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. **Jalankan Aplikasi main1.py**
+   ```bash
+   uvicorn main1:app --reload
+   ```
+
+5. **Akses Aplikasi**
+   
+   Buka browser dan navigasikan ke:
+   ```
+   http://127.0.0.1:8000
+   ```
+   
 ## 📖 Penggunaan
 
 1. Pastikan webcam terhubung dengan komputer
